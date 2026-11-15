@@ -1,0 +1,44 @@
+{
+  "name": "plane-watch",
+  "author": "leyla",
+  "version": "0.1.0",
+  "keywords": [
+    "pebble-app"
+  ],
+  "private": true,
+  "dependencies": {},
+  "scripts": {
+    "test": "node tools/run-tests.js"
+  },
+  "pebble": {
+    "displayName": "Plane Watch",
+    "uuid": "ffb234a1-3ab0-4b2e-a8c7-71e7f600d8d8",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "emery",
+      "gabbro"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "messageKeys": [
+      "PAYLOAD",
+      "CMD",
+      "VAL"
+    ],
+    "capabilities": [
+      "location"
+    ],
+    "resources": {
+      "media": [
+        {
+          "type": "bitmap",
+          "name": "MENU_ICON",
+          "file": "images/menu-icon.png",
+          "menuIcon": true
+        }
+      ]
+    }
+  }
+}

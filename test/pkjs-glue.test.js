@@ -176,3 +176,29 @@ test('a message the watch does not acknowledge is retried and then skipped; the 
   assert.equal(types.filter(x => x === protocol.PAY_BEGIN).length >= 3, true);
   assert.ok(types.includes(protocol.PAY_END));
 });
+
+test('roads come from the map tiles when they answer: binary requests, no Overpass', t => {
+  const mvt = require('./helpers/mvt');
+  const roads = require('../src/common/roads');
+  const tile = mvt.tile([{ name: 'transportation', features: [{ props: { class: 'motorway' }, lines: [[[0, 2048], [4096, 2048]]] }] }]);
+  const env = boot({
+    respond: xhr => {
+      if (xhr.url === roads.TILE_SOURCE) xhr.responseText = JSON.stringify({ tiles: ['https://tiles.test/{z}/{x}/{y}.pbf'] });
+      else if (/^https:\/\/tiles\.test\//.test(xhr.url)) xhr.response = tile.buffer;
+      else return undefined;
+      xhr.status = 200;
+      xhr.onload();
+      return true;
+    }
+  });
+  t.after(env.restore);
+  env.handlers.ready();
+  env.hello();
+  const tiles = env.requests.filter(r => /^https:\/\/tiles\.test\//.test(r.url));
+  assert.equal(tiles.length, 9);
+  assert.ok(tiles.every(r => r.method === 'GET' && r.responseType === 'arraybuffer' && r.timeout === roads.TILE_TIMEOUT_MS));
+  assert.equal(env.requests.find(r => r.url === roads.TILE_SOURCE).responseType, undefined);
+  assert.equal(env.requests.filter(r => /interpreter$/.test(r.url)).length, 0);
+  assert.ok(env.storage.roads_v1.length > 100, 'roads are kept in localStorage');
+  assert.ok(summarise(env.sent).views >= 1);
+});

@@ -1,7 +1,7 @@
 // The phone side of the app: answers the watch's commands with map and aircraft messages (CONTRACTS.md §6). ES5.
 //
 // Everything outside this module is injected, so the whole flow runs in tests without a phone:
-//   deps.http(req, cb(err, text))     req: {method, url, body, timeout}; err.message 'timeout' | 'network' | 'HTTP n'
+//   deps.http(req, cb(err, body))     req: {method, url, body, timeout, binary}; err.message 'timeout' | 'network' | 'HTTP n'
 //   deps.locate(cb(err, lat, lon))
 //   deps.storage                      {get(key) -> string | null, set(key, string)}; set may throw
 //   deps.now() -> ms, deps.setTimeout(fn, ms)
@@ -41,7 +41,9 @@ function createSession(deps) {
   var fallback = null;                   // the previous complete map, shown if the new place's roads fail
   var lastPlanes = { ts: 0, list: [] };
   var trails = planes.createTrails(deps.now);
-  var fetcher = roads.createFetcher({ http: deps.http, now: deps.now, endpoints: deps.endpoints });
+  var fetcher = roads.createFetcher({
+    http: deps.http, now: deps.now, endpoints: deps.endpoints, tileSource: deps.tileSource, log: deps.log
+  });
   var selectedHex = null;
   var locating = false;
   var flushScheduled = false;

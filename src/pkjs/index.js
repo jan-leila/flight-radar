@@ -3,6 +3,7 @@
 
 var protocol = require('../common/protocol');
 var session = require('../common/session');
+var roads = require('../common/roads');
 
 // A position from the last ten minutes is as good as a new one at this scale, and a phone without network
 // location can need most of half a minute for a first fix.
@@ -14,10 +15,10 @@ function http(req, cb) {
   var xhr = new XMLHttpRequest();
   var done = false;
 
-  function finish(err, text) {
+  function finish(err, body) {
     if (done) return;
     done = true;
-    cb(err, text);
+    cb(err, body);
   }
 
   function failure(message) {
@@ -25,11 +26,15 @@ function http(req, cb) {
   }
 
   xhr.open(req.method, req.url, true);
+  if (req.binary) xhr.responseType = 'arraybuffer';
   try { xhr.setRequestHeader('User-Agent', USER_AGENT); } catch (e) { /* forbidden header here */ }
   xhr.timeout = req.timeout;
   xhr.onload = function () {
     var err, retryAfter;
-    if (xhr.status >= 200 && xhr.status < 300) { finish(null, xhr.responseText); return; }
+    if (xhr.status >= 200 && xhr.status < 300) {
+      finish(null, req.binary ? new Uint8Array(xhr.response || []) : xhr.responseText);
+      return;
+    }
     err = new Error('HTTP ' + xhr.status);
     err.status = xhr.status;
     retryAfter = xhr.getResponseHeader && xhr.getResponseHeader('Retry-After');
@@ -67,6 +72,7 @@ Pebble.addEventListener('ready', function () {
   // nothing is fetched before that: the map has to be rendered at the size of the screen it is for.
   app = session.createSession({
     http: http,
+    tileSource: roads.TILE_SOURCE,
     locate: locate,
     storage: {
       get: function (key) { return localStorage.getItem(key); },

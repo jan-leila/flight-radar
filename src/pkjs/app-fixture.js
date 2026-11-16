@@ -41,6 +41,8 @@ function answer(method, url, body) {
     seen.trace++;
     return trace();
   }
+  // No map tiles in this town: the roads have to come from Overpass, as when the tiles cannot be had.
+  if (url.indexOf('https://tiles.') === 0) return null;
   seen.unknown++;
   return null;
 }

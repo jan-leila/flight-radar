@@ -20,8 +20,8 @@ Conventions everywhere:
 ```
               ┌───────────────────────── phone (PebbleKit JS) ─────────────────────────┐
  adsb.lol ───►│ pkjs/index.js  (composition root: XMLHttpRequest, geolocation,        │
- Overpass ───►│   │             localStorage, AppMessage; the only file that knows them)│
-              │   └─ session ──► roads (queries, fail-over, store, packed form) ─► geo │
+ map tiles ──►│   │             localStorage, AppMessage; the only file that knows them)│
+ Overpass ───►│   └─ session ──► roads (tiles, queries, fail-over, store, packed) ► geo │
               │         ├──────► planes (adsb.lol, nearest, trails)                    │
               │         ├──────► raster (roads -> bitmap, RLE) ──────────────────► geo │
               │         └──────► protocol (message bytes, send queue) ──► AppMessage ──┼──┐
@@ -30,9 +30,9 @@ Conventions everywhere:
                                                       ◄─ radar_label (where a label goes)
 ```
 
-Modularity rules (`test/modularity.test.js`): `geo` and `planes` require nothing; `roads` and `raster` only `geo`;
+Modularity rules (`test/modularity.test.js`): `geo`, `planes` and `tiles` require nothing; `raster` only `geo`; `roads` only `geo` and `tiles`;
 `protocol` only `planes`; `session` is the only module in `src/common/` that knows the others and it touches the
-phone only through its `deps`. `src/pkjs/index.js` requires `protocol` and `session` and nothing else.
+phone only through its `deps`. `src/pkjs/index.js` requires `protocol`, `session` and `roads` (for the tile address) and nothing else.
 
 ---
 
@@ -102,23 +102,30 @@ createSender({send, setTimeout, log?}) // → {send(bytes), pending()}
 `createSender` delivers one message at a time, in order. A message that is not acknowledged is sent again twice,
 500 ms apart, and then dropped. See `test/protocol.test.js`.
 
-## 3. `src/common/roads.js` — Overpass and the road store
+## 3. `src/common/roads.js` — tiles, Overpass and the road store
 
 ```js
 TIERS = ['motorway', 'trunk', 'primary', 'secondary']   // `<tier>_link` roads belong to their tier
 STATUS = {OK, CACHE, EMPTY_REGION, COOLDOWN, TIMEOUT, HTTP, NETWORK, PARSE}   // 0..7
 ENDPOINTS                             // Overpass interpreters, tried in this order
+TILE_SOURCE                           // TileJSON of the vector tiles (OpenFreeMap)
 createStore()                         // → {tiers: {<tier>: {lat: [], lon: [], ends: []}}}; ends[i]: one past way i's last point
 addElements(store, tier, elements)    // appends the ways of an Overpass `elements` array; → ways added
 wayCount(store)
 tierQuery(tier, lat, lon)             // → Overpass QL: the tier's ways within 40 miles, `out ids geom`
 statusOfError(err)                    // → STATUS for the watch's banner
-createFetcher({http, now, endpoints?}) // → {fetchTier(tier, lat, lon, cb(err, elements))}
+createFetcher({http, now, endpoints?, tileSource?, log?}) // → {fetchTier(tier, lat, lon, cb(err, elements))}
 pack(store)                           // → {<tier>: base64} | null
 unpack(packed)                        // → store; throws on malformed input
 ```
 
-`fetchTier` posts the query to the endpoint that answered last (the first one at the start) and moves on to the
+With a `tileSource`, the first `fetchTier` for a place reads the TileJSON (its `tiles[0]` is kept for an hour),
+fetches the zoom 9 tiles covering the 40-mile box one after the other (`binary` requests, 15 s each) and answers
+every tier from them, as Overpass-shaped elements; lines wholly outside the box are dropped. Any failure (a tile,
+the TileJSON, a malformed body, more than 36 tiles) fails the tiles as a whole: the tiers then come from Overpass,
+and the tiles are not tried again for a minute. Without a `tileSource` only Overpass is asked.
+
+For Overpass, `fetchTier` posts the query to the endpoint that answered last (the first one at the start) and moves on to the
 next on any failure: transport error, HTTP status, or a body without an `elements` array. An endpoint that
 answers 429 is skipped for `Retry-After` seconds (300 without the header, 1800 at most). When every endpoint
 failed, `cb` gets the last error; when all were skipped, an error with `cooldown: true`.
@@ -127,6 +134,20 @@ failed, `cb` gets the last error; when all were skipped, an error with `cooldown
 in 1e-7 degrees. OSM coordinates have seven decimals, so `unpack(pack(store))` holds the same doubles and a map
 drawn from storage has the same pixels. `pack` returns `null` rather than round a coordinate with more decimals.
 See `test/roads.test.js`.
+
+### 3a. `src/common/tiles.js` — vector tiles
+
+```js
+ZOOM = 9                              // the lowest zoom level whose tiles hold all four tiers
+cover(box, z?)                        // [south, west, north, east] → [{z, x, y}], rows north to south; x not wrapped
+url(template, tile)                   // '{z}/{x}/{y}' filled in, x wrapped
+decode(bytes, tile, classes)          // → {<class>: [[lat, lon, lat, lon, ...], ...]}; throws on a malformed tile
+```
+
+`decode` reads a Mapbox Vector Tile (OpenMapTiles schema): the line features of the layer `transportation` whose
+`class` is one of `classes` (ramps carry their road's class). Coordinates are rounded to seven decimals, which
+`roads.pack` needs. The geometry is simplified for the zoom level, so a map from tiles is not pixel-identical to
+one from Overpass; the comparisons with the original use Overpass data. See `test/tiles.test.js`.
 
 ## 4. `src/common/raster.js` — the map bitmap
 
@@ -166,7 +187,8 @@ See `test/planes.test.js`.
 ```js
 createSession(deps) // → {handle(message)}       message: a protocol.decodeWatchMessage() result
 deps = {
-  http(req, cb(err, text)),   // req: {method, url, body?, timeout}; err.message 'timeout' | 'network' | 'HTTP <status>',
+  http(req, cb(err, body)),   // req: {method, url, body?, timeout, binary?}; body: text, or a Uint8Array when
+                              //      `binary`; err.message 'timeout' | 'network' | 'HTTP <status>',
                               //      err.status, err.retryAfter (seconds)
   locate(cb(err, lat, lon)),
   storage: {get(key) → string | null, set(key, string)},   // set may throw
@@ -174,7 +196,8 @@ deps = {
   send(bytes),                // queue one PAYLOAD
   backlog() → number,         // messages queued but not delivered
   log(text),
-  endpoints?                  // Overpass endpoints, for tests
+  endpoints?,                 // Overpass endpoints, for tests
+  tileSource?                 // TileJSON address (index.js: roads.TILE_SOURCE); without it roads come from Overpass
 }
 ```
 
@@ -283,4 +306,4 @@ Built instead of `index.js` with `PKJS_ENTRY=<file> pebble build`.
   `SUBCMD_SELECT` is logged as `UI-FIXTURE select <hex>`, answered with that plane's trail if it has one, and
   followed by `UI-FIXTURE trail <hex>`. The scene list in `tools/screenshots.sh` and `STEPS` go together.
 - `app-fixture.js` (for `tools/test-app-emulator.sh`): replaces `XMLHttpRequest` and the position with canned
-  ones, logs what was requested so far as `APP-FIXTURE seen planes=N roads=<tiers> trace=N unknown=N` every two seconds, and loads `index.js`.
+  ones, logs what was requested so far as `APP-FIXTURE seen planes=N roads=<tiers> trace=N unknown=N` every two seconds, and loads `index.js`. It has no map tiles (404), so the roads come from its Overpass.

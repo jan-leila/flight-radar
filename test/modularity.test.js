@@ -43,11 +43,12 @@ test('modules require only what CONTRACTS.md allows', () => {
   const allowed = {
     'src/common/geo.js': [],
     'src/common/planes.js': [],
-    'src/common/roads.js': ['src/common/geo.js'],
+    'src/common/tiles.js': [],
+    'src/common/roads.js': ['src/common/geo.js', 'src/common/tiles.js'],
     'src/common/raster.js': ['src/common/geo.js'],
     'src/common/protocol.js': ['src/common/planes.js'],
     'src/common/session.js': ['src/common/geo.js', 'src/common/roads.js', 'src/common/raster.js', 'src/common/planes.js', 'src/common/protocol.js'],
-    'src/pkjs/index.js': ['src/common/protocol.js', 'src/common/session.js'],
+    'src/pkjs/index.js': ['src/common/protocol.js', 'src/common/roads.js', 'src/common/session.js'],
     'src/pkjs/fixture-town.js': [],
     'src/pkjs/ui-fixture.js': ['src/common/protocol.js', 'src/common/raster.js', 'src/common/roads.js', 'src/pkjs/fixture-town.js'],
     'src/pkjs/app-fixture.js': ['src/pkjs/fixture-town.js', 'src/pkjs/index.js']

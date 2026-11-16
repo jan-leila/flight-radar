@@ -180,3 +180,126 @@ test('unpack throws on anything malformed', () => {
   assert.throws(() => roads.unpack(Object.assign({}, packed, { trunk: packed.trunk.slice(0, 40) })), /truncated/);
   assert.throws(() => roads.unpack(Object.assign({}, packed, { trunk: '!!!!' })), /base64/);
 });
+
+// ---- tiles first ------------------------------------------------------------------------------------------------
+const mvt = require('./helpers/mvt');
+const tiles = require('../src/common/tiles');
+const geo = require('../src/common/geo');
+
+const SOURCE = 'https://tiles.test/planet';
+const TEMPLATE = 'https://tiles.test/v1/{z}/{x}/{y}.pbf';
+const HERE = [44.9778, -93.2650];
+// One motorway through the middle of every tile, and a trunk road just outside its north-western corner.
+const TILE = mvt.tile([{
+  name: 'transportation',
+  features: [
+    { props: { class: 'motorway' }, lines: [[[0, 2048], [4096, 2048]]] },
+    { props: { class: 'trunk' }, lines: [[[-60, -60], [-50, -50]]] }
+  ]
+}]);
+
+// A fetcher with a tile source; answer(req) -> body | Error. Overpass (https://o/) answers OK unless told otherwise.
+function tileFetcher(answer, clock) {
+  const asked = [];
+  const logs = [];
+  const fetcher = roads.createFetcher({
+    tileSource: SOURCE,
+    endpoints: ['https://o/'],
+    now: () => clock.now,
+    log: text => logs.push(text),
+    http: (req, cb) => {
+      asked.push(req);
+      let a = answer(req);
+      if (a === undefined) a = req.url === SOURCE ? JSON.stringify({ tiles: [TEMPLATE] }) : req.url === 'https://o/' ? OK : TILE;
+      if (a instanceof Error) cb(a); else cb(null, a);
+    }
+  });
+  return { fetcher, asked, logs };
+}
+
+test('with a tile source, the first tier fetches the tiles of the box and every tier is answered from them', () => {
+  const { fetcher, asked } = tileFetcher(() => undefined, { now: 0 });
+  const got = {};
+  for (const tier of TIERS) fetcher.fetchTier(tier, ...HERE, (err, elements) => { assert.equal(err, null); got[tier] = elements; });
+  const cover = tiles.cover(geo.bbox(...HERE, roads.FETCH_RADIUS_MI));
+  assert.deepEqual(asked.map(r => r.url), [SOURCE].concat(cover.map(t => tiles.url(TEMPLATE, t))));
+  assert.ok(asked.every(r => r.method === 'GET' && r.timeout === roads.TILE_TIMEOUT_MS));
+  assert.ok(asked.slice(1).every(r => r.binary === true) && !asked[0].binary);
+  // lines wholly outside the box are dropped: the motorways of the northern row, the trunk roads at the outer corners
+  assert.equal(got.motorway.length, 6);
+  assert.equal(got.trunk.length, 4);
+  assert.deepEqual(got.secondary, []);
+  assert.equal(got.motorway[0].type, 'way');
+  // the elements go into the store and its packed form like Overpass's
+  const store = roads.createStore();
+  assert.equal(roads.addElements(store, 'motorway', got.motorway), 6);
+  assert.deepEqual(roads.unpack(roads.pack(store)), store);
+});
+
+test('tiles: the tile address is kept for the next place; a tier asked for again is fetched again', () => {
+  const { fetcher, asked } = tileFetcher(() => undefined, { now: 0 });
+  fetcher.fetchTier('motorway', ...HERE, () => {});
+  const first = asked.length;
+  fetcher.fetchTier('motorway', 45.5, -93.2650, () => {});
+  assert.ok(asked.slice(first).every(r => r.url !== SOURCE));
+  const second = asked.length;
+  fetcher.fetchTier('motorway', 45.5, -93.2650, (err, elements) => { assert.equal(err, null); assert.ok(elements.length); });
+  assert.ok(asked.length > second);
+});
+
+test('tiles failed: the tiers come from Overpass, and the tiles are left alone for a minute', () => {
+  const clock = { now: 1000 };
+  let broken = true;
+  const { fetcher, asked, logs } = tileFetcher(req => (broken && /\/9\/123\/184\.pbf$/.test(req.url) ? httpError('HTTP 503', 503) : undefined), clock);
+  const got = [];
+  fetcher.fetchTier('motorway', ...HERE, (err, elements) => got.push([err, elements.length]));
+  fetcher.fetchTier('trunk', ...HERE, (err, elements) => got.push([err, elements.length]));
+  assert.deepEqual(got, [[null, 1], [null, 1]]);
+  assert.deepEqual(asked.filter(r => r.url === 'https://o/').length, 2);
+  assert.match(logs[0], /^road tiles: HTTP 503/);
+  // one attempt at the tiles, not one per tier
+  assert.equal(asked.filter(r => /\/9\/123\/184\.pbf$/.test(r.url)).length, 1);
+  broken = false;
+  clock.now += roads.TILE_RETRY_MS - 1;
+  fetcher.fetchTier('primary', ...HERE, () => {});
+  assert.equal(asked[asked.length - 1].url, 'https://o/');
+  clock.now += 1;
+  fetcher.fetchTier('secondary', ...HERE, (err, elements) => { assert.equal(err, null); assert.deepEqual(elements, []); });
+  assert.match(asked[asked.length - 1].url, /\.pbf$/);
+  // the failed tile made the fetcher read the tile address again
+  assert.equal(asked.filter(r => r.url === SOURCE).length, 2);
+});
+
+test('tiles failed and Overpass too: the tier reports the Overpass error', () => {
+  const { fetcher } = tileFetcher(req => (req.url === SOURCE ? '<html>' : req.url === 'https://o/' ? httpError('timeout') : undefined), { now: 0 });
+  let error;
+  fetcher.fetchTier('motorway', ...HERE, err => { error = err; });
+  assert.equal(roads.statusOfError(error), roads.STATUS.TIMEOUT);
+});
+
+test('tiles: a malformed tile or a TileJSON without an address counts as failed', () => {
+  for (const answer of [
+    req => (/\.pbf$/.test(req.url) ? new Uint8Array(Buffer.from('<html>busy</html>')) : undefined),
+    req => (req.url === SOURCE ? '{"tiles":[]}' : undefined)
+  ]) {
+    const { fetcher, asked } = tileFetcher(answer, { now: 0 });
+    let result;
+    fetcher.fetchTier('motorway', ...HERE, (err, elements) => { result = [err, elements.length]; });
+    assert.deepEqual(result, [null, 1]);
+    assert.equal(asked[asked.length - 1].url, 'https://o/');
+  }
+});
+
+test('tiles: requests answered later are shared by the tiers waiting for them', () => {
+  const waiting = [];
+  const fetcher = roads.createFetcher({
+    tileSource: SOURCE, endpoints: ['https://o/'], now: () => 0,
+    http: (req, cb) => waiting.push(() => cb(null, req.url === SOURCE ? JSON.stringify({ tiles: [TEMPLATE] }) : TILE))
+  });
+  const got = [];
+  fetcher.fetchTier('motorway', ...HERE, (err, elements) => got.push(elements.length));
+  fetcher.fetchTier('trunk', ...HERE, (err, elements) => got.push(elements.length));
+  assert.equal(waiting.length, 1);
+  while (waiting.length) waiting.shift()();
+  assert.deepEqual(got, [6, 4]);
+});

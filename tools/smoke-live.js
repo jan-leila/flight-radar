@@ -1,12 +1,14 @@
-// Runs the real phone-side pipeline against the live services (adsb.lol, Overpass) and reports what the watch
+// Runs the real phone-side pipeline against the live services (adsb.lol, the map tiles, Overpass) and reports what the watch
 // would get. Nothing is mocked except the watch: every message is "delivered" at once.
 //
-// usage: node tools/smoke-live.js [lat lon] [--zoom MI] [--screen WxH] [--png FILE]
-//   default: Minneapolis, 20 mi, 200x228 (emery). --png writes the final map with the aircraft marked.
+// usage: node tools/smoke-live.js [lat lon] [--zoom MI] [--screen WxH] [--png FILE] [--overpass]
+//   default: Minneapolis, 20 mi, 200x228 (emery). --png writes the final map with the aircraft marked;
+//   --overpass leaves the map tiles out, so that the roads come from Overpass.
 'use strict';
 const fs = require('fs');
 const protocol = require('../src/common/protocol');
 const { createSession } = require('../src/common/session');
+const roads = require('../src/common/roads');
 const png = require('./lib/png-diff');
 
 const args = process.argv.slice(2);
@@ -14,6 +16,7 @@ const option = (name, def) => { const i = args.indexOf(name); return i >= 0 ? ar
 const zoom = Number(option('--zoom', 20));
 const [width, height] = option('--screen', '200x228').split('x').map(Number);
 const pngFile = option('--png', null);
+const noTiles = args.includes('--overpass') && args.splice(args.indexOf('--overpass'), 1).length > 0;
 const lat = args.length >= 2 ? Number(args[0]) : 44.9778;
 const lon = args.length >= 2 ? Number(args[1]) : -93.2650;
 
@@ -32,7 +35,7 @@ function http(req, cb) {
     headers: Object.assign({ 'User-Agent': 'plane-watch (Pebble watchapp)' }, req.body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
     signal: controller.signal
   }).then(async res => {
-    const text = await res.text();
+    const text = req.binary ? new Uint8Array(await res.arrayBuffer()) : await res.text();
     clearTimeout(timer);
     say(`${req.method} ${new URL(req.url).host} -> ${res.status}, ${(text.length / 1024).toFixed(0)} KB in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
     if (res.ok) return cb(null, text);
@@ -50,6 +53,7 @@ function http(req, cb) {
 
 const PALETTE = v => [((v >> 4) & 3) * 85, ((v >> 2) & 3) * 85, (v & 3) * 85];
 let lastView = null;
+let stored = false;
 let current = null;
 const storage = {};
 
@@ -74,14 +78,16 @@ function deliver(m) {
         `${current.planes.length} aircraft (${current.planes.slice(0, 4).map(p => p.name || '?').join(', ')}...)`);
     lastView = Object.assign(current, { pixels });
     current = null;
-    if (lastView.roadStatus !== 0) finish();  // the roads failed; the app would try again two minutes later
+    // Done with the complete map on the watch, or when the roads failed (the app would try again two minutes later).
+    if (stored || lastView.roadStatus !== 0) finish();
   }
 }
 
 const session = createSession({
   http,
+  tileSource: noTiles ? undefined : roads.TILE_SOURCE,
   locate: cb => cb(null, lat, lon),
-  storage: { get: key => (key in storage ? storage[key] : null), set: (key, value) => { storage[key] = value; say(`stored ${(value.length / 1024).toFixed(0)} KB of roads`); finish(); } },
+  storage: { get: key => (key in storage ? storage[key] : null), set: (key, value) => { storage[key] = value; say(`stored ${(value.length / 1024).toFixed(0)} KB of roads`); stored = true; if (lastView && !current) finish(); } },
   now: () => Date.now(),
   setTimeout: (fn, ms) => setTimeout(fn, ms),
   send: deliver,

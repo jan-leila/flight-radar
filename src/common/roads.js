@@ -1,9 +1,14 @@
-// Roads: the Overpass queries, the in-memory road store and its compact persistent form (CONTRACTS.md §3). ES5.
+// Roads: where they come from (map tiles, else Overpass), the in-memory road store and its compact persistent form
+// (CONTRACTS.md §3). ES5.
+//
+// The tiles come first: a CDN answers in a fraction of a second, where the public Overpass servers can be busy for
+// hours. Overpass has the unsimplified geometry and is asked when the tiles cannot be had.
 //
 // One Overpass request per road tier keeps every response small enough to parse on a phone: the single
 // all-tiers query with full tags answers with tens of megabytes for a metropolitan area.
 
 var geo = require('./geo');
+var tiles = require('./tiles');
 
 // Drawing order is the reverse of this list (raster.js): motorways end up on top.
 var TIERS = ['motorway', 'trunk', 'primary', 'secondary'];
@@ -12,6 +17,14 @@ var FETCH_RADIUS_MI = 40;       // one fetch covers every zoom level
 var TIER_TIMEOUT_MS = 30000;    // per endpoint and tier
 var DEFAULT_COOLDOWN_S = 300;   // after HTTP 429 without Retry-After
 var MAX_COOLDOWN_S = 1800;
+
+// TileJSON of the vector tiles (OpenFreeMap: OpenMapTiles schema, no key). Its `tiles` entry names the current
+// version of the tile set, so it is read again now and then.
+var TILE_SOURCE = 'https://tiles.openfreemap.org/planet';
+var TILE_TIMEOUT_MS = 15000;       // per request
+var TILE_SOURCE_TTL_MS = 3600000;
+var TILE_RETRY_MS = 60000;         // after the tiles failed, Overpass alone is asked for this long
+var MAX_TILES = 36;                // more than that (close to a pole) is left to Overpass
 
 var ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
@@ -88,18 +101,120 @@ function statusOfError(err) {
   return STATUS.PARSE;
 }
 
+// The roads of every tier within FETCH_RADIUS_MI, from the tiles covering that box:
+// cb(err, {<tier>: elements}), elements shaped like Overpass's ({type: 'way', geometry: [{lat, lon}, ...]}).
+// One failed tile fails the whole fetch: a map with a hole in it is worse than one that arrives later.
+//   deps: { http, now }, state: {template, templateTs} kept between calls
+function fetchTiles(deps, source, state, lat, lon, cb) {
+  var box = geo.bbox(lat, lon, FETCH_RADIUS_MI);
+  var todo = tiles.cover(box);
+  var out = {};
+  var i;
+  for (i = 0; i < TIERS.length; i++) out[TIERS[i]] = [];
+  if (todo.length > MAX_TILES) { cb(new Error('too many tiles')); return; }
+
+  function add(tier, lines) {
+    var l, k, line, geometry, inside;
+    for (l = 0; l < lines.length; l++) {
+      line = lines[l];
+      geometry = [];
+      inside = false;
+      for (k = 0; k < line.length; k += 2) {
+        geometry.push({ lat: line[k], lon: line[k + 1] });
+        if (line[k] >= box[0] && line[k] <= box[2] && line[k + 1] >= box[1] && line[k + 1] <= box[3]) inside = true;
+      }
+      // The tiles reach beyond the box; lines wholly outside it would only fill the storage.
+      if (inside) out[tier].push({ type: 'way', geometry: geometry });
+    }
+  }
+
+  function next() {
+    var tile = todo.shift();
+    if (!tile) { cb(null, out); return; }
+    deps.http({ method: 'GET', url: tiles.url(state.template, tile), timeout: TILE_TIMEOUT_MS, binary: true },
+      function (err, bytes) {
+        var decoded, t;
+        if (!err) {
+          try {
+            decoded = tiles.decode(bytes, tile, TIERS);
+            for (t = 0; t < TIERS.length; t++) add(TIERS[t], decoded[TIERS[t]]);
+          } catch (e) {
+            err = e;
+          }
+        }
+        if (err) {
+          state.template = null;   // perhaps the tile set was replaced: read the TileJSON again next time
+          cb(err);
+          return;
+        }
+        next();
+      });
+  }
+
+  if (state.template && deps.now() - state.templateTs < TILE_SOURCE_TTL_MS) { next(); return; }
+  deps.http({ method: 'GET', url: source, timeout: TILE_TIMEOUT_MS }, function (err, text) {
+    var template = null;
+    if (!err) {
+      try {
+        template = JSON.parse(text).tiles[0];
+        if (typeof template !== 'string' || template.indexOf('{z}') < 0) throw new Error('no tile address');
+      } catch (e) {
+        err = e;
+      }
+    }
+    if (err) { cb(err); return; }
+    state.template = template;
+    state.templateTs = deps.now();
+    next();
+  });
+}
+
 // Fetches roads tier by tier.
-//   deps: { http(req, cb(err, text)), now() -> ms, endpoints? }
-//     http's errors carry `message` ('timeout' | 'network' | 'HTTP <status>'), `status` and `retryAfter` (seconds).
-// fetcher.fetchTier(tier, lat, lon, cb(err, elements)) tries the endpoints in order, starting with the one that
-// answered last, and skips endpoints that are cooling down after a 429. `err.cooldown` is set when every endpoint
-// is cooling down.
+//   deps: { http(req, cb(err, body)), now() -> ms, endpoints?, tileSource?, log? }
+//     http answers with text, or with the bytes (Uint8Array) of a request that has `binary` set; its errors carry
+//     `message` ('timeout' | 'network' | 'HTTP <status>'), `status` and `retryAfter` (seconds).
+// fetcher.fetchTier(tier, lat, lon, cb(err, elements)).
+// With deps.tileSource (the address of a TileJSON) the first tier asked for a place fetches the tiles for all
+// tiers, and every tier is answered from them. When the tiles fail, and without a tileSource, a tier comes from
+// Overpass: the endpoints are tried in order, starting with the one that answered last, skipping those that are
+// cooling down after a 429. `err.cooldown` is set when every endpoint is cooling down.
 function createFetcher(deps) {
   var endpoints = deps.endpoints || ENDPOINTS;
   var cooldownUntil = {};
   var preferred = 0;
+  var tileState = { template: null, templateTs: 0 };
+  var tileJob = null;   // {key, state: 'loading' | 'ok' | 'failed', byTier, waiting, failedTs}
 
   function fetchTier(tier, lat, lon, cb) {
+    var key = lat + ',' + lon;
+    var job = tileJob;
+
+    function answer() {
+      var elements = job.state === 'ok' ? job.byTier[tier] : null;
+      if (!elements) { fromOverpass(tier, lat, lon, cb); return; }
+      delete job.byTier[tier];   // the caller keeps them; a tier asked for again is fetched again
+      cb(null, elements);
+    }
+
+    if (!deps.tileSource) { fromOverpass(tier, lat, lon, cb); return; }
+    if (!job || job.key !== key || (job.state === 'ok' && !job.byTier[tier]) ||
+        (job.state === 'failed' && deps.now() - job.failedTs >= TILE_RETRY_MS)) {
+      job = tileJob = { key: key, state: 'loading', byTier: null, waiting: [], failedTs: 0 };
+      fetchTiles(deps, deps.tileSource, tileState, lat, lon, function (err, byTier) {
+        var waiting = job.waiting;
+        var i;
+        job.waiting = [];
+        job.state = err ? 'failed' : 'ok';
+        job.byTier = byTier || null;
+        job.failedTs = deps.now();
+        if (err && deps.log) deps.log('road tiles: ' + err.message + ', asking Overpass');
+        for (i = 0; i < waiting.length; i++) waiting[i]();
+      });
+    }
+    if (job.state === 'loading') job.waiting.push(answer); else answer();
+  }
+
+  function fromOverpass(tier, lat, lon, cb) {
     var body = 'data=' + encodeURIComponent(tierQuery(tier, lat, lon));
     var lastErr = null;
     var tried = 0;
@@ -294,6 +409,9 @@ module.exports = {
   TIERS: TIERS,
   STATUS: STATUS,
   ENDPOINTS: ENDPOINTS,
+  TILE_SOURCE: TILE_SOURCE,
+  TILE_TIMEOUT_MS: TILE_TIMEOUT_MS,
+  TILE_RETRY_MS: TILE_RETRY_MS,
   FETCH_RADIUS_MI: FETCH_RADIUS_MI,
   TIER_TIMEOUT_MS: TIER_TIMEOUT_MS,
   createStore: createStore,

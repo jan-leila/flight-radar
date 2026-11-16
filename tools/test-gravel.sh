@@ -15,7 +15,7 @@
 # answered); --expect locating fails when it does not: that is what Gravel's defaults (internet and location
 # denied) have to give.
 #
-# The first time a watch is attached Gravel asks "Keep watch / Replace" on the phone: answer it, the script waits.
+# A watch Gravel has not seen makes it ask "Keep watch / Replace" on the phone; the script answers "Keep watch".
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 if ! command -v pebble >/dev/null 2>&1; then
@@ -77,11 +77,13 @@ sleep 1
 
 # Always the same port on the device, so that Gravel sees the same watch on every run.
 "${ADB[@]}" reverse "tcp:$DEVICE_PORT" "tcp:$PORT" >/dev/null || fail "adb reverse"
+# Gravel still retrying a watch that is gone can end up connecting to neither: start it afresh.
+"${ADB[@]}" shell am force-stop "$GRAVEL"
 "${ADB[@]}" shell monkey -p "$GRAVEL" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
 sleep 3
 broadcast ADD_QEMU_WATCH QemuSetupReceiver --es host 127.0.0.1 --ei port "$DEVICE_PORT" | grep -q 'result=0' ||
   fail "Gravel did not take the watch (a release build has no adb hooks)"
-echo "[gravel] attached the $PLAT emulator; waiting for Gravel to connect (answer 'Keep watch' on the phone if asked)"
+echo "[gravel] attached the $PLAT emulator; waiting for Gravel to connect"
 "${ADB[@]}" forward tcp:9000 tcp:9000 >/dev/null || fail "adb forward"
 
 LOG=$OUT/$PLAT-logs.txt
@@ -103,6 +105,17 @@ screen() {
     "test/screenshots/baseline/$PLAT/01-locating.png" "$SHOT"
 }
 
+# Taps the button with this text on the phone, if it is on the screen.
+tap() {
+  local b
+  "${ADB[@]}" shell uiautomator dump /sdcard/gravel-test-ui.xml >/dev/null 2>&1 || return 1
+  b=$("${ADB[@]}" shell cat /sdcard/gravel-test-ui.xml | sed 's/>/>\n/g' | grep -F "text=\"$1\"" | head -1 |
+      sed -n 's/.*bounds="\[\([0-9]*\),\([0-9]*\)\]\[\([0-9]*\),\([0-9]*\)\]".*/\1 \2 \3 \4/p')
+  [ -n "$b" ] || return 1
+  set -- $b
+  "${ADB[@]}" shell input tap $(( ($1 + $3) / 2 )) $(( ($2 + $4) / 2 ))
+}
+
 running=0
 for _ in $(seq 40); do  # until Gravel has the watch (and the question on the phone is answered) and the app is up
   if broadcast DEV_CONNECTION DevConnectionReceiver | grep -q 'result=0'; then
@@ -116,6 +129,7 @@ for _ in $(seq 40); do  # until Gravel has the watch (and the question on the ph
       [ "$(screen)" != other ] && { running=1; break; }
     fi
   fi
+  tap 'Keep watch' && echo "[gravel] answered Gravel's question with 'Keep watch'"
   sleep 3
 done
 [ "$running" = 1 ] || fail "the app did not start through Gravel (is the watch connected in Gravel?)"

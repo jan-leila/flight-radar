@@ -10,7 +10,7 @@ The screen follows [Flight Radar](https://apps.repebble.com/flight-radar_fc84423
 - **SELECT:** zoom. The app starts with 20 miles from the centre to the nearer screen edge; each press goes on to 40, 5, 10 and back to 20.
 - **BACK:** drop the selection; with nothing selected, leave the app.
 
-Aircraft data comes from [adsb.lol](https://adsb.lol) (no key), road data from [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors through the Overpass API (no key).
+Aircraft data comes from [adsb.lol](https://adsb.lol) (no key). Road data is from [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors: vector map tiles from [OpenFreeMap](https://openfreemap.org) ([OpenMapTiles](https://openmaptiles.org) schema, no key), and the Overpass API (no key) when the tiles cannot be had.
 
 ## What is different from the original
 
@@ -19,15 +19,17 @@ The watch app draws the same pixels for the same messages; that is tested agains
 | | original 0.4.1 | this app |
 |---|---|---|
 | first aircraft on screen | after the roads arrived (or 65 s) | as soon as adsb.lol answers; the map follows |
-| road query | one query for all roads with all tags: about 34 MB for Minneapolis | one query per road tier, geometry only |
-| road servers | overpass-api.de | three Overpass servers, tried in turn; one that answers 429 is left alone for a while |
+| road source | one Overpass query for all roads with all tags: about 34 MB for Minneapolis | nine map tiles from a CDN (about 1 MB, under a second); Overpass only when they fail, one query per road tier, geometry only |
+| Overpass servers | overpass-api.de | three, tried in turn; one that answers 429 is left alone for a while |
 | while roads load | every 30 s refresh starts another full road query | one road fetch at a time |
 | roads failed | shown once the app is reopened | fetched again two minutes later, only the missing tiers |
-| stored roads | raw JSON, too big for `localStorage` in a city, so fetched on every launch | packed losslessly (about 6 characters per point, 1.3 MB for Minneapolis), kept for a week |
+| stored roads | raw JSON, too big for `localStorage` in a city, so fetched on every launch | packed losslessly (about 200 KB for Minneapolis from tiles, 1.3 MB from Overpass), kept for a week |
 | `[PE8] UA blocked` banner | shown where the phone's JavaScript cannot set a User-Agent | never shown |
 | `location` capability | not declared | declared |
 | aircraft refresh | a 30 s floor counted from the last answer, which by the code drops every other 30 s request of the watch once the roads are loaded | every request is answered |
 | position | no older than 1 minute, 15 s to get one | no older than 10 minutes, 30 s to get one |
+
+| the map's pixels | from Overpass geometry | from tile geometry, simplified for zoom level 9 (about 13 m): the same roads, not always the same pixels. From Overpass data the map is byte-identical, which is what the tests compare |
 
 The status texts on the way to the first map differ accordingly (`Fetching roads...` appears under the aircraft instead of before them).
 
@@ -55,7 +57,8 @@ Each part is tested on its own (see `CONTRACTS.md` for the interfaces):
 | part | test | command (inside nix-shell) |
 |---|---|---|
 | projection, geohash | `test/geo.test.js` | `node tools/run-tests.js geo` |
-| road queries, fail-over, stored form | `test/roads.test.js` | `node tools/run-tests.js roads` |
+| road sources (tiles first, Overpass fail-over), stored form | `test/roads.test.js` | `node tools/run-tests.js roads` |
+| vector tiles | `test/tiles.test.js` | `node tools/run-tests.js tiles` |
 | map rendering | `test/raster.test.js` | `node tools/run-tests.js raster` |
 | aircraft, flight paths | `test/planes.test.js` | `node tools/run-tests.js planes` |
 | phone⇄watch protocol, send queue | `test/protocol.test.js` | `node tools/run-tests.js protocol` |
@@ -68,7 +71,7 @@ Each part is tested on its own (see `CONTRACTS.md` for the interfaces):
 | end to end in the emulator (real phone side, canned network) | `tools/test-app-emulator.sh [platform]` | |
 | through Gravel (real phone side in Gravel's runtime, live services) | `tools/test-gravel.sh` | needs an adb device with a debug build of Gravel |
 
-`node tools/run-tests.js` runs every `test/*.test.js`. `node tools/smoke-live.js [lat lon] [--zoom MI] [--screen WxH] [--png FILE]` runs the real pipeline against the live services and reports what the watch would get.
+`node tools/run-tests.js` runs every `test/*.test.js`. `node tools/smoke-live.js [lat lon] [--zoom MI] [--screen WxH] [--png FILE] [--overpass]` runs the real pipeline against the live services and reports what the watch would get.
 
 ### Pixel comparison with the original
 
